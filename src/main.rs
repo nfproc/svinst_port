@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, read};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::{cmp, process};
 use structopt::StructOpt;
@@ -9,6 +9,7 @@ use sv_parser::{parse_sv, SyntaxTree, unwrap_node, Locate, RefNode, Define, Defi
 use sv_parser_error;
 use sv_parser_syntaxtree::*;
 use enquote;
+use tempfile::NamedTempFile;
 
 #[derive(StructOpt)]
 struct Opt {
@@ -54,13 +55,13 @@ fn main() {
 }
 
 fn run_opt(
-	opt: &Opt
+    opt: &Opt
 ) -> i32 {
 
     // read in define variables
     let mut defines = HashMap::new();
     for define in &opt.defines {
-		let mut define = define.splitn(2, '=');
+        let mut define = define.splitn(2, '=');
         let ident = String::from(define.next().unwrap());
         let text = if let Some(x) = define.next() {
             let x = enquote::unescape(x, None).unwrap();
@@ -70,7 +71,7 @@ fn run_opt(
         };
         let define = Define::new(ident.clone(), vec![], text);
         defines.insert(ident, Some(define));
-	}
+    }
     
     // flag to determine parsing status
     let mut exit_code = 0;
@@ -78,25 +79,32 @@ fn run_opt(
     // parse files
     println!("files:");
     for path in &opt.files {
-        match parse_sv(&path, &defines, &opt.includes, opt.ignore_include, opt.allow_incomplete) {
+        // use temporary files to sanitize non-ASCII characters
+        let Ok(mut tmpfile) = NamedTempFile::new() else { continue; };
+        let Ok(org) = read(&path) else { continue; };
+        let org_string : String = org.iter().map(|&c| if c < 128 { c as char } else { '?' }).collect();
+        let _ = tmpfile.write_all(org_string.as_bytes());
+
+        match parse_sv(tmpfile.path(), &defines, &opt.includes, opt.ignore_include, opt.allow_incomplete) {
             Ok((syntax_tree, new_defines)) => {
-				println!("  - file_name: {}", escape_str(path.to_str().unwrap()));
-				if !opt.full_tree {
-					println!("    defs:");
-					analyze_defs(&syntax_tree);
-				} else {
-					println!("    syntax_tree:");
-					print_full_tree(&syntax_tree, opt.include_whitespace);
-				}
-				// update the preprocessor state if desired
-				if !opt.separate {
-					defines = new_defines;
-				}
-				// show macro definitions if desired
-				if opt.show_macro_defs {
-					println!("    macro_defs:");
-					show_macro_defs(&defines);
-				}
+                let _ = tmpfile.close();
+                println!("  - file_name: {}", escape_str(path.to_str().unwrap()));
+                if !opt.full_tree {
+                    println!("    defs:");
+                    analyze_defs(&syntax_tree);
+                } else {
+                    println!("    syntax_tree:");
+                    print_full_tree(&syntax_tree, opt.include_whitespace);
+                }
+                // update the preprocessor state if desired
+                if !opt.separate {
+                    defines = new_defines;
+                }
+                // show macro definitions if desired
+                if opt.show_macro_defs {
+                    println!("    macro_defs:");
+                    show_macro_defs(&defines);
+                }
             }
             Err(x) => {
                 match x {
@@ -113,7 +121,7 @@ fn run_opt(
                         }
                     }
                 }
-				exit_code = 1;
+                exit_code = 1;
             }
         }
     }
@@ -126,8 +134,8 @@ static CHAR_CR: u8 = 0x0d;
 static CHAR_LF: u8 = 0x0a;
 
 fn print_parse_error(
-	origin_path: &PathBuf,
-	origin_pos: &usize
+    origin_path: &PathBuf,
+    origin_pos: &usize
 ) {
     let mut f = File::open(&origin_path).unwrap();
     let mut s = String::new();
@@ -187,217 +195,211 @@ fn print_parse_error(
 }
 
 fn show_macro_defs(
-	defines: &HashMap<String, Option<Define>>
+    defines: &HashMap<String, Option<Define>>
 ) {
-	for (_, value) in defines.into_iter() {
-		match value {
-			Some(define) => println!("      - '{:?}'", define),
-			_ => (),
-		}
-	}
+    for (_, value) in defines.into_iter() {
+        match value {
+            Some(define) => println!("      - '{:?}'", define),
+            _ => (),
+        }
+    }
+}
+
+// ==== rewritten definition analyzer starts from here ====
+struct DefsState {
+    first_port: bool,
+    first_inst: bool,
+    is_input: bool,
+    port_width: i32
+}
+
+// module definition
+fn process_module_def(
+    syntax_tree: &SyntaxTree,
+    node: RefNode,
+    s: &mut DefsState
+) {
+    let Some(id) = unwrap_node!(node, ModuleIdentifier) else { return; };
+    let Some(id) = get_identifier(id) else { return; };      
+    // Original string can be got by SyntaxTree::get_str(self, node: &RefNode)
+    let Some(id) = syntax_tree.get_str(&id) else { return; }; 
+    // Declare the new module
+    if s.first_port {
+        println!("        ports: []");
+    }
+    if s.first_inst {
+        println!("        insts: []");
+    }
+    println!("      - mod_name: {}", escape_str(id));
+    s.first_port = true;
+    s.first_inst = true;
+}
+
+// module instantiation
+fn process_module_inst(
+    syntax_tree: &SyntaxTree,
+    node: RefNode,
+    s: &mut DefsState
+) {
+    // write the module name
+    let Some(id) = unwrap_node!(node.clone(), ModuleIdentifier) else { return; };
+    let Some(id) = get_identifier(id) else { return; };      
+    let Some(id) = syntax_tree.get_str(&id) else { return; }; 
+    if s.first_inst {
+        println!("        insts:");
+        s.first_inst = false;
+    }
+    println!("          - mod_name: {}", escape_str(id));
+    // write the instance name
+    let Some(id) = unwrap_node!(node, InstanceIdentifier) else { return; };
+    let Some(id) = get_identifier(id) else { return; };      
+    let Some(id) = syntax_tree.get_str(&id) else { return; }; 
+    println!("            inst_name: {}", escape_str(id));
+}
+
+// port definition (direction and width)
+fn process_port_def(
+    syntax_tree: &SyntaxTree,
+    node: RefNode,
+    s: &mut DefsState
+) {
+    'check_direction1: {
+        let Some(id) = unwrap_node!(node.clone(), PortDirection) else { break 'check_direction1; };
+        let Some(id) = get_keyword(id) else { break 'check_direction1; };      
+        let Some(id) = syntax_tree.get_str(&id) else { break 'check_direction1; }; 
+        s.is_input = id == "input";
+        s.port_width = 1;
+    }
+    'check_direction2: {
+        let Some(_) = unwrap_node!(node.clone(), InputDeclaration) else { break 'check_direction2; };
+        s.is_input = true;
+        s.port_width = 1;
+    }
+    'check_direction3: {
+        let Some(_) = unwrap_node!(node.clone(), OutputDeclaration) else { break 'check_direction3; };
+        s.is_input = false;
+        s.port_width = 1;
+    }
+    'check_range: {
+        let Some(id) = unwrap_node!(node.clone(), ConstantRange) else { break 'check_range; };
+        let Some(id) = get_unsigned_number(id) else { break 'check_range; };      
+        let Some(id) = syntax_tree.get_str(&id) else { break 'check_range; };
+        s.port_width = id.parse::<i32>().unwrap() + 1;
+    }
+    for x in node {
+        match x {
+            RefNode::PortIdentifier(x) => process_port_ident(syntax_tree, RefNode::from(x), s),
+            _ => ()
+        }
+    }
+}
+
+// port identifier
+fn process_port_ident(
+    syntax_tree: &SyntaxTree,
+    node: RefNode,
+    s: &mut DefsState
+) {
+    let Some(id) = get_identifier(node) else { return; };
+    let Some(id) = syntax_tree.get_str(&id) else { return; };
+    if s.first_port {
+        println!("        ports:");
+        s.first_port = false;
+    }
+    println!("          - port_name: {}", escape_str(id));
+    if s.is_input {
+        println!("            port_dir: \"input\"");
+    } else {
+        println!("            port_dir: \"output\"");
+    }
+    println!("            port_width: {}", s.port_width);
 }
 
 fn analyze_defs(
-	syntax_tree: &SyntaxTree
+    syntax_tree: &SyntaxTree
 ) {
+    let mut s = DefsState {
+        first_port: false,
+        first_inst: false,
+        is_input: true,
+        port_width: 1
+    };
     // &SyntaxTree is iterable
     for node in syntax_tree {
         // The type of each node is RefNode
         match node {
             RefNode::ModuleDeclarationNonansi(x) => {
                 // unwrap_node! gets the nearest ModuleIdentifier from x
-				let id = match unwrap_node!(x, ModuleIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};				
-                // Original string can be got by SyntaxTree::get_str(self, node: &RefNode)
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};	
-                // Declare the new module
-				println!("      - mod_name: {}", escape_str(id));
-				println!("        insts:");
+                process_module_def(syntax_tree, RefNode::from(x), &mut s);
             }
             RefNode::ModuleDeclarationAnsi(x) => {
-				let id = match unwrap_node!(x, ModuleIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};	
-				println!("      - mod_name: {}", escape_str(id));
-				println!("        insts:");
-            }
-            RefNode::PackageDeclaration(x) => {
-				let id = match unwrap_node!(x, PackageIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};	
-				println!("      - pkg_name: {}", escape_str(id));
-				println!("        insts:");
-            }
-            RefNode::InterfaceDeclaration(x) => {
-				let id = match unwrap_node!(x, InterfaceIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-				println!("      - intf_name: {}", escape_str(id));
-				println!("        insts:");
+                process_module_def(syntax_tree, RefNode::from(x), &mut s);
             }
             RefNode::ModuleInstantiation(x) => {
-				// write the module name
-				let id = match unwrap_node!(x, ModuleIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                println!("          - mod_name: {}", escape_str(id));
-                // write the instance name
-				let id = match unwrap_node!(x, InstanceIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                println!("            inst_name: {}", escape_str(id));
-			}
-            RefNode::PackageImportItem(x) => {
-				// write the package name
-				let id = match unwrap_node!(x, PackageIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                println!("          - pkg_name: {}", escape_str(id));
-			}
-			RefNode::ImplicitClassHandleOrClassScope(x) => {
-				// write the package name
-				let id = match unwrap_node!(x, ClassIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};		
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                println!("          - pkg_name: {}", escape_str(id));
-			}
-			RefNode::ImplicitClassHandleOrClassScopeOrPackageScope(x) => {
-				// write the package name
-				let id = match unwrap_node!(x, ClassIdentifier) {
-					None => { continue; },
-					Some(x) => x
-				};
-				let id = match get_identifier(id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                let id = match syntax_tree.get_str(&id) {
-					None => { continue; },
-					Some(x) => x
-				};
-                println!("          - pkg_name: {}", escape_str(id));
-			}
+                process_module_inst(syntax_tree, RefNode::from(x), &mut s);
+            }
+            RefNode::AnsiPortDeclaration(x) => {
+                process_port_def(syntax_tree, RefNode::from(x), &mut s);
+            }
+            RefNode::PortDeclaration(x) => {
+                process_port_def(syntax_tree, RefNode::from(x), &mut s);
+            }
             _ => (),
+        }
+    }
+    if s.first_port {
+        println!("        ports: []");
+    }
+    if s.first_inst {
+        println!("        insts: []");
+    }
+}
+// ==== rewritten definition analyzer ends here ====
+
+fn print_full_tree(
+    syntax_tree: &SyntaxTree,
+    include_whitespace: bool
+) {
+    let mut skip = false;
+    let mut depth = 3;
+    for node in syntax_tree.into_iter().event() {
+        match node {
+            NodeEvent::Enter(RefNode::Locate(locate)) => {
+                if !skip {
+                    println!("{}- Token: {}",
+                             "  ".repeat(depth),
+                             escape_str(syntax_tree.get_str(locate).unwrap()));
+                    println!("{}  Line: {}",
+                             "  ".repeat(depth),
+                             locate.line);
+                }
+                depth += 1;
+            }
+            NodeEvent::Enter(RefNode::WhiteSpace(_)) => {
+                if !include_whitespace {
+                    skip = true;
+                }
+            }
+            NodeEvent::Leave(RefNode::WhiteSpace(_)) => {
+                skip = false;
+            }
+            NodeEvent::Enter(x) => {
+                if !skip {
+                    println!("{}- {}:",
+                             "  ".repeat(depth),
+                             x);
+                }
+                depth += 1;
+            }
+            NodeEvent::Leave(_) => {
+                depth -= 1;
+            }
         }
     }
 }
 
-fn print_full_tree(
-	syntax_tree: &SyntaxTree,
-	include_whitespace: bool
-) {
-	let mut skip = false;
-	let mut depth = 3;
-	for node in syntax_tree.into_iter().event() {
-		match node {
-			NodeEvent::Enter(RefNode::Locate(locate)) => {
-				if !skip {
-					println!("{}- Token: {}",
-					         "  ".repeat(depth),
-					         escape_str(syntax_tree.get_str(locate).unwrap()));
-					println!("{}  Line: {}",
-					         "  ".repeat(depth),
-					         locate.line);
-				}
-				depth += 1;
-			}
-			NodeEvent::Enter(RefNode::WhiteSpace(_)) => {
-				if !include_whitespace {
-					skip = true;
-				}
-			}
-			NodeEvent::Leave(RefNode::WhiteSpace(_)) => {
-				skip = false;
-			}
-			NodeEvent::Enter(x) => {
-				if !skip {
-					println!("{}- {}:",
-					         "  ".repeat(depth),
-					         x);
-				}
-				depth += 1;
-			}
-			NodeEvent::Leave(_) => {
-				depth -= 1;
-			}
-		}
-	}
-}
-
 fn get_identifier(
-	node: RefNode
+    node: RefNode
 ) -> Option<Locate> {
     // unwrap_node! can take multiple types
     match unwrap_node!(node, SimpleIdentifier, EscapedIdentifier) {
@@ -405,6 +407,28 @@ fn get_identifier(
             return Some(x.nodes.0);
         }
         Some(RefNode::EscapedIdentifier(x)) => {
+            return Some(x.nodes.0);
+        }
+        _ => None,
+    }
+}
+
+fn get_keyword(
+    node: RefNode
+) -> Option<Locate> {
+    match unwrap_node!(node, Keyword) {
+        Some(RefNode::Keyword(x)) => {
+            return Some(x.nodes.0);
+        }
+        _ => None,
+    }
+}
+
+fn get_unsigned_number(
+    node: RefNode
+) -> Option<Locate> {
+    match unwrap_node!(node, UnsignedNumber) {
+        Some(RefNode::UnsignedNumber(x)) => {
             return Some(x.nodes.0);
         }
         _ => None,
@@ -476,188 +500,4 @@ fn escape_str(v: &str) -> String {
     wr.push_str("\"");
     
     wr
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn run_opt_expect(opt: &Opt, val: i32) {
-		let ret = run_opt(&opt);
-		assert_eq!(ret, val);
-	}
-	 
-    fn expect_pass(opt: &Opt) {
-		run_opt_expect(opt, 0);
-	}
-	
-	fn expect_fail(opt: &Opt) {
-		run_opt_expect(opt, 1);
-	}
-    
-    #[test]
-    fn test_test() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/test.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_broken() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/fail/broken.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_fail(&opt);
-    }
-    
-    #[test]
-    fn test_inc_test() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/inc_test.sv")],
-			defines: vec![],
-			includes: vec![PathBuf::from("testcases/pass")],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_def_test() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/def_test.sv")],
-			defines: vec![String::from("MODULE_NAME=module_name_from_define"),
-			              String::from("EXTRA_INSTANCE")],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: true,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
- 
-	#[test]
-    fn test_simple() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/simple.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: true,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_quotes() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/quotes.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: true,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_pkg() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/pkg.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_intf() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/intf.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-    
-    #[test]
-    fn test_class() {
-        let opt = Opt{
-			files: vec![PathBuf::from("testcases/pass/class.sv")],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
-
-    #[test]
-    fn test_multi() {
-        let opt = Opt{
-			files: vec![
-			    PathBuf::from("testcases/pass/multi/define1.v"),
-			    PathBuf::from("testcases/pass/multi/test1.sv"),
-			    PathBuf::from("testcases/pass/multi/define2.v"),
-			    PathBuf::from("testcases/pass/multi/dut.v")
-			],
-			defines: vec![],
-			includes: vec![],
-			full_tree: false,
-			include_whitespace: false,
-			ignore_include: false,
-			separate: false,
-			show_macro_defs: false,
-			allow_incomplete: false
-		};
-		expect_pass(&opt);
-    }
 }

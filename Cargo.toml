@@ -1,13 +1,13 @@
 [package]
-name = "svinst"
+name = "svinst_port"
 version = "0.1.6"
-authors = ["sgherbst@gmail.com"]
-repository = "https://github.com/sgherbst/svinst"
+authors = ["nfujieda@aitech.ac.jp", "sgherbst@gmail.com"]
+repository = "https://github.com/nfproc/svinst_port"
 keywords = ["parser", "verilog", "systemverilog"]
 categories = ["parsing"]
 license = "MIT"
 readme = "README.md"
-description = "Determines the modules declared and instantiated in SystemVerilog files, producing a YAML file as output."
+description = "Determines the modules and their ports in Verilog/SystemVerilog files. This package is derived from svinst."
 edition = "2018"
 
 [dependencies]
@@ -16,3 +16,4 @@ sv-parser-error = "0.12.1"
 sv-parser-syntaxtree = "0.12.1"
 structopt = "0.3.20"
 enquote = "1.0.3"
+tempfile = "3.10.1"
